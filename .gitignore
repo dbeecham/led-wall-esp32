@@ -1,0 +1,4 @@
+build
+cscope.*
+tags
+.gdb_history
