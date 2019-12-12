@@ -1,6 +1,13 @@
+// Some info:
+// The SPI2 and SPI3 has some pins called IO_MUX pins, which allows for speeds
+// up to 80MHz, compared to using a general GPIO, which "only" allows for 40
+// MHz. For SPI2, the MOSI is pin 13, which is the one we use.
+
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
+#include <time.h>
+#include <sys/time.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/queue.h"
@@ -10,7 +17,10 @@
 #include "esp_system.h"
 #include "esp_wifi.h"
 #include "esp_event.h"
+#include "esp_attr.h"
+#include "esp_sleep.h"
 #include "esp_log.h"
+#include "esp_sntp.h"
 #include "nvs_flash.h"
 #include "lwip/err.h"
 #include "lwip/sys.h"
@@ -18,10 +28,19 @@
 #include "lwip/netdb.h"
 #include "lwip/dns.h"
 
+// spi
+#include <hal/spi_types.h>
+#include <driver/spi_master.h>
+
+spi_device_handle_t spi;
+
 #define GPIO_PIN 2
 #define GPIO_PIN_SEL (1ULL << GPIO_PIN)
-#define RMT_CHANNEL 1
+#define RMT_CHANNEL 2
 #define RMT_CLOCK_DIV 4
+#define SPI_CHANNEL 1
+#define SPI_CHANNEL_1_MOSI 12
+#define SPI_CHANNEL_1_SCLK 14
 
 // For these, one tick is 50ns.
 #define RMT_TICKS_BIT_1_HIGH_WS2812 12 // 12*50ns = 600 ns
@@ -36,8 +55,9 @@
 
 #define WIFI_CONNECTED_BIT BIT0
 #define NATS_CONNECTED_BIT BIT1
+#define TIME_SYNC_BIT BIT2
 
-#define NUM_PIXELS 50
+#define NUM_PIXELS 49
 
 #define NATS_HOST "192.168.4.1"
 #define NATS_PORT "4222"
@@ -46,27 +66,10 @@
 static EventGroupHandle_t s_wifi_event_group;
 static QueueHandle_t event_queue;
 
-rmt_item32_t one = {
-        .level0 = 1,
-        .duration0 = RMT_TICKS_BIT_1_HIGH_WS2812,
-        .level1 = 0,
-        .duration1 = RMT_TICKS_BIT_1_LOW_WS2812
-};
-
-rmt_item32_t zero = {
-        .level0 = 1,
-        .duration0 = RMT_TICKS_BIT_0_HIGH_WS2812,
-        .level1 = 0,
-        .duration1 = RMT_TICKS_BIT_0_LOW_WS2812
-};
-
-rmt_item32_t reset = {
-        .level0 = 0,
-        .duration0 = 0,
-        .level1 = 0,
-        .duration1 = RMT_TICKS_RESET
-};
-
+uint32_t one  = SPI_SWAP_DATA_TX(0b11111111111111100000000000000000, 32);
+uint32_t zero = SPI_SWAP_DATA_TX(0b11111100000000000000000000000000, 32);
+//uint32_t one  = SPI_SWAP_DATA_TX(0b11101010101010101010101010101010, 32);
+//uint32_t zero = SPI_SWAP_DATA_TX(0b11110000111100001111000011110000, 32);
 
 struct matrix_rgb_s {
     uint8_t r;
@@ -75,8 +78,20 @@ struct matrix_rgb_s {
 
 };
 
-struct matrix_rgb_s display_buf[NUM_PIXELS] = {0};
-rmt_item32_t rmt_items[24*NUM_PIXELS] = {0};
+
+struct display_event_s {
+    struct timespec tv;
+    struct matrix_rgb_s display_buf[NUM_PIXELS];
+};
+
+uint32_t rmt_items[24*NUM_PIXELS] = {0};
+
+
+void time_sync_notification_cb(struct timeval *tv)
+{
+    ESP_LOGI("time_sync", "time is synced");
+    xEventGroupSetBits(s_wifi_event_group, TIME_SYNC_BIT);
+}
 
 
 static void event_handler (
@@ -97,6 +112,11 @@ static void event_handler (
         ip_event_got_ip_t* event = (ip_event_got_ip_t*) event_data;
         ESP_LOGI("H", "got ip:" IPSTR, IP2STR(&event->ip_info.ip));
         xEventGroupSetBits(s_wifi_event_group, WIFI_CONNECTED_BIT);
+        // Initialize NTP
+        sntp_setoperatingmode(SNTP_OPMODE_POLL);
+        sntp_setservername(0, "192.168.4.1");
+        sntp_set_time_sync_notification_cb(time_sync_notification_cb);
+        sntp_init();
     }
 }
 
@@ -134,11 +154,10 @@ static void wifi_init_sta (
     ESP_LOGI("H", "wifi_init_sta finished.");
 }
 
-
 // This function takes an rgb display buffer and draws it on the display
 // using an rmt channel.
 static void matrix_display_draw_rgb (
-    rmt_item32_t * items,
+    uint32_t * items,
     struct matrix_rgb_s * buf,
     uint32_t buf_len
 )
@@ -146,7 +165,7 @@ static void matrix_display_draw_rgb (
 
     uint32_t rmt_i = 0;
     uint8_t bit;
-    
+
     // For each pixel...
     for (int i = 0; i < buf_len; i++) {
 
@@ -180,16 +199,24 @@ static void matrix_display_draw_rgb (
             }
             rmt_i += 1;
         }
+
+        spi_device_queue_trans(spi, &(spi_transaction_t) {
+            .tx_buffer = &rmt_items[rmt_i-24],
+            .length = 32*24,
+            .rxlength = 0
+        }, 0);
+
     }
 
     // Finally, write out the buffer.
-    rmt_write_items(
-        /* rmt_channel_t channel = */ RMT_CHANNEL,
-        /* rmt_item32_t * rmt_items = */ rmt_items,
-        /* item_len = */ 24*buf_len,
-        /* bool wait_tx_done = */ true
-    );
-
+//    printf("%u:%u ", rmt_items[8], rmt_items[9]);
+//    spi_device_transmit(spi, &(spi_transaction_t) {
+//        .tx_buffer = rmt_items,
+//        //.length = 32*24*NUM_PIXELS,
+//        .length = 32*24,
+//        .rxlength = 0
+//    });
+//    printf("(%u:%u)\n", rmt_items[8], rmt_items[9]);
 }
 
 
@@ -209,6 +236,20 @@ static void nats_task (
     char *p, *pe, *eof = NULL;
     int cs = 0;
     uint8_t color_i = 0;
+    uint8_t tv_sec_i = 0;
+    uint8_t tv_nsec_i = 0;
+
+    union {
+        long tv_sec;
+        uint8_t raw[8];
+    } my_tv_sec;
+
+    union {
+        long tv_nsec;
+        uint8_t raw[8];
+    } my_tv_nsec;
+
+    struct display_event_s display_event = {0};
 
     %%{
         machine nats;
@@ -236,23 +277,49 @@ static void nats_task (
         }
 
         action copy_red {
-            display_buf[color_i].r = *p;
+            display_event.display_buf[color_i].r = *p;
         }
 
         action copy_green {
-            display_buf[color_i].g = *p;
+            display_event.display_buf[color_i].g = *p;
         }
 
         action copy_blue {
-            display_buf[color_i].b = *p;
+            display_event.display_buf[color_i].b = *p;
         }
 
         action display {
-            xQueueSend(event_queue, &(int){1}, 1);
+            xQueueSend(event_queue, &display_event, 0);
+        }
+
+        action zero_tv_sec {
+            tv_sec_i = 0;
+        }
+
+        action copy_tv_sec {
+            my_tv_sec.raw[tv_sec_i++] = *p;
+        }
+
+        action fin_tv_sec {
+            display_event.tv.tv_sec = my_tv_sec.tv_sec;
+        }
+
+        action zero_tv_nsec {
+            tv_nsec_i = 0;
+        }
+
+        action copy_tv_nsec {
+            my_tv_nsec.raw[tv_nsec_i++] = *p;
+        }
+
+        action fin_tv_nsec {
+            display_event.tv.tv_nsec = my_tv_nsec.tv_nsec;
         }
 
         msg := 
-            ' matrix1.in 1 147\r\n' @{ color_i = 0; }
+            ' matrix1.in 1 163\r\n' @{ color_i = 0; }
+                any{8} >to(zero_tv_sec) $copy_tv_sec @fin_tv_sec
+                any{8} >to(zero_tv_nsec) $copy_tv_nsec @fin_tv_nsec
                 (
                   any $copy_red 
                   any $copy_green
@@ -300,6 +367,14 @@ static void nats_task (
                 portMAX_DELAY
         );
         ESP_LOGI("nats_task", "wifi is connected, connecting to nats at %s:%s...", NATS_HOST, NATS_PORT);
+        xEventGroupWaitBits(
+                /* event_group = */ s_wifi_event_group, 
+                /* bit = */ TIME_SYNC_BIT,
+                false,
+                true,
+                portMAX_DELAY
+        );
+        ESP_LOGI("nats_task", "ok we have time...");
 
         // Find address of the nats server
         int ret = getaddrinfo(NATS_HOST, NATS_PORT, &hints, &servinfo);
@@ -368,15 +443,38 @@ static void led_task (
 {
 
     BaseType_t qres;
-    uint_fast8_t event;
+    struct display_event_s display_event = {0};
+    struct timespec tv;
+    int64_t tv_sec_diff;
+    int64_t tv_nsec_diff;
+    uint32_t sleep_ms;
+
 
     while(1) {
-        qres = xQueueReceive(event_queue, &event, 500 / portTICK_PERIOD_MS);
+        qres = xQueueReceive(event_queue, &display_event, portMAX_DELAY);
         if (pdFALSE == qres) {
             continue;
         }
 
-        matrix_display_draw_rgb(rmt_items, display_buf, NUM_PIXELS);
+        // Wait until it's time to display this event...
+        clock_gettime(CLOCK_REALTIME, &tv);
+        tv_sec_diff = display_event.tv.tv_sec - tv.tv_sec;
+        tv_nsec_diff = display_event.tv.tv_nsec - tv.tv_nsec;
+
+        if (tv_sec_diff < 0 || (0 == tv_sec_diff && tv_nsec_diff < 0)) {
+            // We already missed this event - just skip it.
+            printf("missed event - supposed to be at %ld, but we're at %ld\n", display_event.tv.tv_sec, tv.tv_sec);
+            continue;
+        }
+
+        sleep_ms = tv_sec_diff*1000 + tv_nsec_diff/1000000;
+        if (sleep_ms > 3000) sleep_ms = 3000;
+
+        vTaskDelay(sleep_ms / portTICK_PERIOD_MS);
+
+        //vTaskSuspendAll();
+        matrix_display_draw_rgb(rmt_items, display_event.display_buf, NUM_PIXELS);
+        //xTaskResumeAll();
     }
 }
 
@@ -385,6 +483,7 @@ void app_main (
     void
 )
 {
+
 
     // Initialize nvs
     esp_err_t ret = nvs_flash_init();
@@ -396,28 +495,60 @@ void app_main (
 
 
     // Initialize queue
-    event_queue = xQueueCreate(2,1);
+    event_queue = xQueueCreate(128, sizeof(struct display_event_s));
+    // TODO: error check
 
-    // Init RMT
-    rmt_config(&(rmt_config_t){
-            .channel = RMT_CHANNEL,
-            .gpio_num = GPIO_PIN,
-            .clk_div = RMT_CLOCK_DIV, // clock source is 80MHz. Divide it to something useful
-            .mem_block_num = 1,
-            .rmt_mode = RMT_MODE_TX,
-            .tx_config = {
-                .loop_en = false,
-                .carrier_freq_hz = 100, // not used, but has to be set to avoid divide by 0 err
-                .carrier_duty_percent = 50,
-                .carrier_level = RMT_CARRIER_LEVEL_LOW,
-                .carrier_en = false,
-                .idle_level = RMT_IDLE_LEVEL_LOW,
-                .idle_output_en = true,
 
-            }
-    });
-    rmt_driver_install(RMT_CHANNEL, 0, 0);
+    ret = spi_bus_initialize(
+        /* spi_host_device_t host = */ SPI2_HOST,
+        /* spi_bus_config_t * config = */ &(spi_bus_config_t) {
+            .miso_io_num = -1,
+            .mosi_io_num = SPI_CHANNEL_1_MOSI,
+            .sclk_io_num = SPI_CHANNEL_1_SCLK,
+            .quadwp_io_num = -1,
+            .quadhd_io_num = -1,
+            .max_transfer_sz = 8192
+        },
+        /* dma_chan = */ 1
+    );
+    if (ESP_OK != ret) {
+        ESP_LOGE(__func__, "Could not initialize SPI bus.");
+        return -1;
+    }
 
+    ret = spi_bus_add_device(
+        /* spi_host_device_t host = */ SPI2_HOST,
+        /* spi_device_interface_config_t * config = */ &(spi_device_interface_config_t) {
+            .command_bits = 0,
+            .address_bits = 0,
+            .dummy_bits = 0,
+            .clock_speed_hz = 25641025,
+            .mode = 1,
+            .spics_io_num = -1,
+            .queue_size = NUM_PIXELS,
+            .cs_ena_posttrans = 0,
+            .cs_ena_pretrans = 0,
+            .flags = SPI_DEVICE_HALFDUPLEX | SPI_DEVICE_3WIRE,
+            .input_delay_ns = 0
+        },
+        /* spi_device_handle_t * handle = */ &spi
+    );
+    if (ESP_OK != ret) {
+        ESP_LOGE(__func__, "spi_bus_add_device() returned %d", ret);
+        return -1;
+    }
+
+//    while (true) {
+//        spi_device_transmit(spi, &(spi_transaction_t) {
+//            .tx_buffer = &(uint32_t[4]){spi_ws2811_zero, spi_ws2811_one, spi_ws2811_zero, spi_ws2811_one},
+//            .length = 32*2,
+//            .rxlength = 0
+//        });
+//        vTaskDelay(50 / portTICK_PERIOD_MS);
+//    }
+
+
+    // Core 0 gets wifi interrupts
     xTaskCreatePinnedToCore(
         led_task,
         "ledtask",
@@ -425,7 +556,7 @@ void app_main (
         NULL,
         1,
         NULL,
-        0
+        1
     );
 
     xTaskCreatePinnedToCore(
@@ -433,10 +564,10 @@ void app_main (
         "ledtask",
         4096,
         NULL,
-        1,
+        0,
         NULL,
-        1
+        0
     );
+   wifi_init_sta();
 
-    wifi_init_sta();
 }
